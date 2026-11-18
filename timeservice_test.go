@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -76,17 +77,22 @@ func TestNtpOverTLS(t *testing.T) {
 // A legacy unicast query (source port != 5353) for smgw.local is answered directly.
 func TestSmgwMdns(t *testing.T) {
 	ip := ifaceIPv4ForTest(t)
-	go serveSmgwMdns(net.IPv4(192, 0, 2, 1).To4())
-	time.Sleep(300 * time.Millisecond)
-	q := new(dns.Msg)
-	q.SetQuestion(smgwName, dns.TypeA)
-	q.RecursionDesired = false
-	out, _ := q.Pack()
 	c, err := net.ListenPacket("udp4", ip.String()+":0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c.Close()
+	// Answer only this test's own socket: the responder listens on the real
+	// network, and other devices asking for smgw.local must not get 192.0.2.1.
+	own := c.LocalAddr().String()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go serveSmgwMdns(ctx, net.IPv4(192, 0, 2, 1).To4(), func(src net.Addr) bool { return src.String() == own })
+	time.Sleep(300 * time.Millisecond)
+	q := new(dns.Msg)
+	q.SetQuestion(smgwName, dns.TypeA)
+	q.RecursionDesired = false
+	out, _ := q.Pack()
 	buf := make([]byte, 1500)
 	// Port 5353 is shared with Avahi, so a unicast query may land there instead: try a few times.
 	for i := 0; i < 10; i++ {

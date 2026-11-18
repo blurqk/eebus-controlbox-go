@@ -46,12 +46,14 @@ func startTimeService(cert tls.Certificate) {
 			log.Fatalf("SMGW_IP: invalid IPv4 address %q", s)
 		}
 	}
-	go serveSmgwMdns(fixedIP)
+	go serveSmgwMdns(context.Background(), fixedIP, nil)
 	go serveNtpOverTLS(cert)
 }
 
-// serveSmgwMdns answers mDNS A queries for smgw.local.
-func serveSmgwMdns(fixedIP net.IP) {
+// serveSmgwMdns answers mDNS A queries for smgw.local until ctx ends. accept,
+// if not nil, limits the answers to queries from matching senders (tests: only
+// their own socket, so no device on the LAN gets a test address).
+func serveSmgwMdns(ctx context.Context, fixedIP net.IP, accept func(src net.Addr) bool) {
 	// Share port 5353 with a running Avahi daemon.
 	lc := net.ListenConfig{Control: func(_, _ string, rc syscall.RawConn) error {
 		var serr error
@@ -67,6 +69,10 @@ func serveSmgwMdns(fixedIP net.IP) {
 		log.Printf("smgw.local: mDNS listen failed: %v", err)
 		return
 	}
+	go func() {
+		<-ctx.Done()
+		_ = c.Close()
+	}()
 	p := ipv4.NewPacketConn(c)
 	_ = p.SetControlMessage(ipv4.FlagInterface, true)
 	_ = p.SetMulticastTTL(255)
@@ -87,8 +93,13 @@ func serveSmgwMdns(fixedIP net.IP) {
 	for {
 		n, cm, src, err := p.ReadFrom(buf)
 		if err != nil {
-			log.Printf("smgw.local: mDNS read failed: %v", err)
+			if ctx.Err() == nil {
+				log.Printf("smgw.local: mDNS read failed: %v", err)
+			}
 			return
+		}
+		if accept != nil && !accept(src) {
+			continue
 		}
 		var q dns.Msg
 		if q.Unpack(buf[:n]) != nil || q.Response {
