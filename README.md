@@ -49,6 +49,11 @@ ControlBox is configured via environment variables or a `.env` file in the worki
 | `SMGW_TIME` | Time service for the Weidmüller ERC (see below), on by default. `0` switches it off. |
 | `SMGW_IP` | IPv4 address announced for `smgw.local`. Default: the address of the interface the query arrived on. |
 | `EEBUS_DEBUG` | Set to any value to enable debug logging (SHIP handshake, SPINE messages). |
+| `HTTP_PORT` | Port of the web interface, default 7080 (80 on a dedicated server). |
+| `UI` | `vue` serves the original Vue frontend instead of the Tasmota-style page. |
+| `SHIP_ID`, `DEVICE_SERIAL` | Own SHIP ID and serial. Default like the Tasmota control box: serial = last 8 hex digits of the own SKI, SHIP ID `PPC-SMGWplus-<serial>`. Set both to take over the identity of another control box (together with its certificate). |
+| `CONNECT_PEERS` | Devices to connect to at start, `ski[:shipid],...`. Maintained by `EEBusConnect` / `EEBusDisconnect`. |
+| `HB_RECONNECT` | Reconnect a device whose heartbeat stays away (more than twice its promised timeout, then 3 min), at most every 10 min; never an energy manager. On by default, `0` switches it off. |
 
 `.env` contains the private key and possibly the pairing secret. Do not commit it.
 
@@ -84,6 +89,24 @@ Some devices only accept pairing for a limited time after power-up, and only tru
 The ERC gets its clock from the PPC smart meter gateway it was designed for, not from the internet. At boot it looks up `smgw.local` via mDNS, opens a TLS 1.2 connection to TCP port 4460 and sends a plain 48 byte NTP client packet inside it. It does not verify the server certificate. Without an answer it logs `PPCCLS_TIMESYNC_CONNECT: could not connect to peer` and its clock starts at 1970.
 
 ControlBox answers both the mDNS query and the time request with the host's clock (UTC). The ERC asks only once per boot, so restart it after starting ControlBox. Only one device should answer `smgw.local`: run either this simulator or the Tasmota one, not both (`SMGW_TIME=0` here or `EEBusSmgw 0` on the Tasmota). Binding port 4460 and sharing mDNS port 5353 needs no root rights. The ERC must be able to reach TCP port 4460 on the ControlBox host.
+
+#### Tasmota-compatible web interface
+
+By default ControlBox serves the page of the Tasmota EEBUS control box
+(`web/steuerbox.html`, unchanged) at `/` and `/steuerbox`, and answers its console
+commands at `/cm?cmnd=...` with the same JSON: `EEBusStatus`, `EEBusPeers`, `EEBusScan`,
+`EEBusData`, `EEBusStruct`, `EEBusRead`, `EEBusCert`, `EEBusPair`, `EEBusSmgw`,
+`EEBusLpc`, `EEBusRelease`, `EEBusLpp`, `EEBusLppFrei`, `EEBusFailsafe`, `EEBusConnect`,
+`EEBusDisconnect`. Integrations reading the Tasmota (e.g. Home Assistant REST sensors on
+`EEBusData` / `EEBusStatus`) work by changing the address. Differences:
+
+- the private key is not offered for download (`/ufsd`), it stays in `.env`;
+- `EEBusCert 2` does not create a new identity from the page;
+- a lost heartbeat leads to a reconnect (`HB_RECONNECT`), and `EEBusStatus` reports
+  the number of reconnects as `Neuaufbau`.
+
+Run as a systemd service on a small Linux host (static build: `CGO_ENABLED=0 go build`),
+working directory with `.env`, `AmbientCapabilities=CAP_NET_BIND_SERVICE` for port 80.
 
 #### ControlBox Frontend
 

@@ -50,7 +50,6 @@ func main() {
 
 	srv := new(controlbox)
 	srv.run()
-	setupRoutes(srv)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
@@ -63,5 +62,15 @@ func main() {
 		os.Exit(0)
 	}()
 
-	log.Fatal(http.ListenAndServe(":"+strconv.Itoa(httpdPort), nil))
+	// HTTP_PORT: port of the web interface (default 7080). UI=vue serves the
+	// original Vue frontend instead of the Tasmota-style steuerbox page.
+	port := httpdPort
+	if p, err := strconv.Atoi(os.Getenv("HTTP_PORT")); err == nil && p > 0 {
+		port = p
+	}
+	if os.Getenv("UI") == "vue" {
+		setupRoutes(srv)
+		log.Fatal(http.ListenAndServe(":"+strconv.Itoa(port), nil))
+	}
+	startTasmotaUI(srv, port)
 }

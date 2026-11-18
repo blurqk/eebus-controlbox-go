@@ -261,7 +261,7 @@ func serveWs(h *controlbox, w http.ResponseWriter, r *http.Request) {
 
 	// state of every connected device for the control target and status table
 	frontend.sendDeviceStatus(h.deviceStatus())
-	for ski, connected := range h.isConnected {
+	for ski, connected := range h.isConnected.snapshot() {
 		if info, exists := h.remoteInfos[ski]; connected && exists && info.Device != nil {
 			for _, entity := range info.Device.Entities() {
 				readData(h, entity, nil)
@@ -295,7 +295,7 @@ func reader(h *controlbox, ws *websocket.Conn) error {
 
 			info, exists := h.remoteInfos[remoteSki]
 			if !exists {
-				connected, exists2 := h.isConnected[remoteSki]
+				connected, exists2 := h.isConnected.get(remoteSki)
 				if !exists2 || !connected {
 					// TODO
 					// fingerprint and shipID are optional, but should be provided if available

@@ -27,7 +27,6 @@ import (
 	"github.com/enbility/ship-go/mdns"
 	spineapi "github.com/enbility/spine-go/api"
 	"github.com/enbility/spine-go/model"
-	"github.com/joho/godotenv"
 	_ "github.com/joho/godotenv/autoload"
 )
 
@@ -44,7 +43,7 @@ type controlbox struct {
 	ucmgcp ucapi.MaMGCPInterface
 	ucmpc  ucapi.MaMPCInterface
 
-	isConnected map[string]bool
+	isConnected *connMap
 
 	remoteInfos  map[string]RemoteInfo
 	useCaseInfos map[string][]UseCaseInfo
@@ -112,12 +111,13 @@ func generateAndPersistCertificate() (tls.Certificate, error) {
 		Bytes: keyBytes,
 	})
 
-	// Write CERT_PEM / KEY_PEM to .env — if we got here they were absent.
-	// godotenv.Write handles quoting/escaping; multi-line PEM is stored as-is.
-	if err := godotenv.Write(map[string]string{
+	// Add CERT_PEM / KEY_PEM to .env — if we got here they were absent. Merge
+	// with the existing settings: writing only the two keys used to wipe all
+	// other settings (MDNS_ZEROCONF, PAIRING_QR, ...) on the first start.
+	if err := updateEnv(map[string]string{
 		"CERT_PEM": string(certPEMBytes),
 		"KEY_PEM":  string(keyPEMBytes),
-	}, envPath); err != nil {
+	}); err != nil {
 		return tls.Certificate{}, fmt.Errorf("write %s: %w", envPath, err)
 	}
 
@@ -145,8 +145,13 @@ func parsePairingQR(qr string) (shipapi.PairingTarget, error) {
 		}
 		value = strings.TrimSpace(value)
 		switch key {
+		case "SKI", "FPH256", "SPSEC":
+			// the ERC prints its SKI in groups of four ("3976 5FF1 ...")
+			value = strings.ReplaceAll(value, " ", "")
+		}
+		switch key {
 		case "SKI":
-			target.SKI = value
+			target.SKI = strings.ToLower(value)
 		case "ID":
 			target.ShipID = value
 		case "FPH256":
@@ -181,13 +186,32 @@ func (h *controlbox) run() {
 		log.Fatal(err)
 	}
 
+	// Identity like the Tasmota control box: serial = last 8 hex digits of the own
+	// SKI, SHIP ID "PPC-SMGWplus-<serial>". SHIP_ID / DEVICE_SERIAL override them,
+	// e.g. when taking over the identity of another control box (certificate plus
+	// SHIP ID) that the remote devices already trust.
+	ownSki := ""
+	if len(certificate.Certificate) > 0 {
+		if x, err := x509.ParseCertificate(certificate.Certificate[0]); err == nil {
+			ownSki, _ = cert.SkiFromCertificate(x)
+		}
+	}
 	vendorCode := "PPC"
 	deviceBrand := "PPC"
 	deviceModel := "SMGWplus"
-	serialNumber := "123456789"
-	altIdentifier := "ControlBox Simulator SN-" + serialNumber
+	serialNumber := os.Getenv("DEVICE_SERIAL")
+	if serialNumber == "" && len(ownSki) >= 8 {
+		serialNumber = ownSki[len(ownSki)-8:]
+	}
+	if serialNumber == "" {
+		serialNumber = "123456789"
+	}
+	altIdentifier := os.Getenv("SHIP_ID")
+	if altIdentifier == "" {
+		altIdentifier = vendorCode + "-" + deviceModel + "-" + serialNumber
+	}
 
-	h.isConnected = map[string]bool{}
+	h.isConnected = newConnMap()
 
 	// Optional SHIP Pairing Service: act as announcer (devZ) towards a device
 	// whose pairing QR code content is given in PAIRING_QR.
@@ -219,6 +243,10 @@ func (h *controlbox) run() {
 	}
 
 	h.myService = service.NewService(configuration, h)
+	tapi = newTasmotaAPI(h, ownSki, altIdentifier, serialNumber)
+	if pairingTarget != nil {
+		tapi.setPairing(pairingTarget, os.Getenv("PAIRING_QR"))
+	}
 	h.myService.SetLogging(h)
 
 	if err = h.myService.Setup(); err != nil {
@@ -231,6 +259,8 @@ func (h *controlbox) run() {
 	h.myService.SetAutoAccept(true)
 
 	_ = h.myService.LocalDevice().Events().Subscribe(discoveryLogger{})
+	_ = h.myService.LocalDevice().Events().Subscribe(tapi)
+	fmt.Println("Local SKI:", ownSki, " SHIP ID:", altIdentifier)
 
 	localEntity := h.myService.LocalDevice().EntityForType(model.EntityTypeTypeGridGuard)
 	h.uclpc = lpc.NewLPC(localEntity, h.OnLPCEvent)
@@ -257,6 +287,11 @@ func (h *controlbox) run() {
 		startTimeService(certificate)
 	}
 
+	for _, identity := range connectPeers() {
+		fmt.Println("Verbinde mit", identity.SKI, identity.ShipID)
+		h.myService.RegisterRemoteService(identity)
+	}
+
 	if pairingTarget != nil {
 		// The announcer must already trust the target before announcing.
 		h.myService.RegisterRemoteService(shipapi.NewServiceIdentity(
@@ -280,7 +315,8 @@ func (h *controlbox) run() {
 func (h *controlbox) RemoteServiceConnected(service api.ServiceInterface, identity shipapi.ServiceIdentity) {
 	remoteSki = identity.SKI
 	fmt.Println("RemoteServiceConnected: " + identity.SKI)
-	h.isConnected[identity.SKI] = true
+	h.isConnected.set(identity.SKI, true)
+	tapi.connected(identity.SKI, true)
 
 	frontend.sendText(SelectService, identity.SKI)
 	frontend.sendDeviceStatus(h.deviceStatus())
@@ -288,7 +324,8 @@ func (h *controlbox) RemoteServiceConnected(service api.ServiceInterface, identi
 
 func (h *controlbox) RemoteServiceDisconnected(service api.ServiceInterface, identity shipapi.ServiceIdentity) {
 	fmt.Println("RemoteServiceDisconnected: " + identity.SKI)
-	h.isConnected[identity.SKI] = false
+	h.isConnected.set(identity.SKI, false)
+	tapi.connected(identity.SKI, false)
 
 	frontend.sendNotification("", ServiceListChanged, "")
 	frontend.sendDeviceStatus(h.deviceStatus())
@@ -315,12 +352,11 @@ func (h *controlbox) ServiceUpdated(identity shipapi.ServiceIdentity) {
 }
 
 func (h *controlbox) ServicePairingDetailUpdate(identity shipapi.ServiceIdentity, detail *shipapi.ConnectionStateDetail) {
-	if identity.SKI == remoteSki && detail.State() == shipapi.ConnectionStateRemoteDeniedTrust {
-		fmt.Println("The remote service denied trust. Exiting.")
+	// A device denying trust used to end the program; as a service that only
+	// leads to a restart loop. Log it and keep serving the other devices.
+	if detail.State() == shipapi.ConnectionStateRemoteDeniedTrust {
+		fmt.Println("The remote service denied trust:", identity.SKI)
 		h.myService.CancelPairing(identity)
-		h.myService.UnregisterRemoteService(identity)
-		h.myService.Shutdown()
-		os.Exit(1)
 	}
 
 	frontend.sendNotification("", ServiceListChanged, "")
@@ -342,7 +378,7 @@ func (h *controlbox) ServiceAutoTrustRemoved(service api.ServiceInterface, ident
 // so the frontend can offer them as targets and show their state side by side.
 func (h *controlbox) deviceStatus() []DeviceStatus {
 	list := []DeviceStatus{}
-	for ski, connected := range h.isConnected {
+	for ski, connected := range h.isConnected.snapshot() {
 		if !connected {
 			continue
 		}
@@ -466,7 +502,7 @@ func (h *controlbox) OnLPCEvent(ski string, device spineapi.DeviceRemoteInterfac
 	}
 
 	fmt.Println("--> LPC Event: " + string(event) + " from " + ski)
-	connected, exists := h.isConnected[ski]
+	connected, exists := h.isConnected.get(ski)
 	if !exists || !connected {
 		fmt.Println("--> but not connected")
 		return
@@ -595,7 +631,7 @@ func (h *controlbox) OnLPPEvent(ski string, device spineapi.DeviceRemoteInterfac
 	}
 
 	fmt.Println("--> LPP Event: " + string(event) + " from " + ski)
-	connected, exists := h.isConnected[ski]
+	connected, exists := h.isConnected.get(ski)
 	if !exists || !connected {
 		fmt.Println("--> but not connected")
 		return
@@ -670,7 +706,7 @@ func (h *controlbox) OnMGCPEvent(ski string, device spineapi.DeviceRemoteInterfa
 	}
 
 	fmt.Println("--> MGCP Event: " + string(event) + " from " + ski)
-	connected, exists := h.isConnected[ski]
+	connected, exists := h.isConnected.get(ski)
 	if !exists || !connected {
 		fmt.Println("--> but not connected")
 		return
@@ -726,7 +762,7 @@ func (h *controlbox) OnMPCEvent(ski string, device spineapi.DeviceRemoteInterfac
 	}
 
 	fmt.Println("--> MPC Event: " + string(event) + " from " + ski)
-	connected, exists := h.isConnected[ski]
+	connected, exists := h.isConnected.get(ski)
 	if !exists || !connected {
 		fmt.Println("--> but not connected")
 		return

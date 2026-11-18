@@ -22,6 +22,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -178,6 +179,7 @@ func handleNtpOverTLS(c net.Conn) {
 	req := make([]byte, 48)
 	if _, err := io.ReadFull(c, req); err != nil {
 		log.Printf("smgw.local: time request from %s failed: %v", c.RemoteAddr(), err)
+		timeServed(false)
 		return
 	}
 	rx := time.Now()
@@ -195,8 +197,10 @@ func handleNtpOverTLS(c net.Conn) {
 	putNtpTime(resp[40:48], tx)   // transmit time
 	if _, err := c.Write(resp); err != nil {
 		log.Printf("smgw.local: time reply to %s failed: %v", c.RemoteAddr(), err)
+		timeServed(false)
 		return
 	}
+	timeServed(true)
 	log.Printf("smgw.local: time sent to %s (NTP v%d, %s)", c.RemoteAddr(), version, tx.UTC().Format(time.RFC3339))
 	// Send close_notify and let the client close first: closing at once can reset the
 	// connection before the client has read the reply.
@@ -205,6 +209,35 @@ func handleNtpOverTLS(c net.Conn) {
 	}
 	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
 	_, _ = io.Copy(io.Discard, c)
+}
+
+// statistics of the time service for EEBusSmgw
+type timeStat struct {
+	served, failed       int
+	last, prev, failedAt time.Time
+}
+
+var (
+	timeMu   sync.Mutex
+	timeData timeStat
+)
+
+func timeStats() timeStat {
+	timeMu.Lock()
+	defer timeMu.Unlock()
+	return timeData
+}
+
+func timeServed(ok bool) {
+	timeMu.Lock()
+	defer timeMu.Unlock()
+	if ok {
+		timeData.served++
+		timeData.prev, timeData.last = timeData.last, time.Now()
+	} else {
+		timeData.failed++
+		timeData.failedAt = time.Now()
+	}
 }
 
 func putNtpTime(b []byte, t time.Time) {
