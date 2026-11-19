@@ -103,9 +103,9 @@ type peerState struct {
 }
 
 type mdnsPeer struct {
-	Ski, Id, Brand, Model, Type, Cat, Register, Ip, Host, Path string
-	Port                                                       int
-	seen                                                       time.Time
+	Ski, Id, Brand, Model, Type, Cat, Register, Ip, Host, Path, Name string
+	Port                                                             int
+	seen                                                             time.Time
 }
 
 type readRequest struct {
@@ -275,7 +275,10 @@ func (t *tasmotaAPI) browse() {
 						return
 					}
 					t.mdnsEntry(e)
-				case <-removed:
+				case e, ok := <-removed:
+					if ok {
+						t.mdnsRemoved(e)
+					}
 				case <-ctx.Done():
 					return
 				}
@@ -323,11 +326,43 @@ func (t *tasmotaAPI) mdnsEntry(e *zeroconf.ServiceEntry) {
 	*m = mdnsPeer{
 		Ski: ski, Id: txt["id"], Brand: txt["brand"], Model: txt["model"], Type: txt["type"],
 		Cat: txt["cat"], Register: txt["register"], Ip: ip, Host: strings.TrimSuffix(strings.TrimSuffix(e.HostName, "."), ".local"),
-		Path: txt["path"], Port: e.Port, seen: time.Now(),
+		Path: txt["path"], Port: e.Port, seen: time.Now(), Name: e.Instance,
 	}
 	if m.Ip == "" && m.Host != "" {
 		go t.resolveHost(ski, m.Host)
 	}
+}
+
+// mdnsRemoved drops a device that withdrew its announcement (goodbye packet or
+// expired TTL). zeroconf reports a device only when it is new or changes, so the
+// list must not expire entries by age: devices announcing rarely (evcc, WARP4)
+// vanished from the list after 15 minutes although they were connected.
+func (t *tasmotaAPI) mdnsRemoved(e *zeroconf.ServiceEntry) {
+	if e == nil {
+		return
+	}
+	ski := ""
+	for _, s := range e.Text {
+		if k, v, ok := strings.Cut(unescapeDNS(s), "="); ok && strings.EqualFold(k, "ski") {
+			ski = strings.ToLower(v)
+		}
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if ski == "" { // goodbye packets may come without TXT: match by instance name
+		for k, m := range t.mdns {
+			if m.Name != "" && m.Name == e.Instance {
+				ski = k
+			}
+		}
+	}
+	if ski == "" {
+		return
+	}
+	if p := t.peers[ski]; p != nil && !p.since.IsZero() {
+		return // still connected: keep it selectable
+	}
+	delete(t.mdns, ski)
 }
 
 // unescapeDNS turns the \\DDD escapes of DNS text (UTF-8 bytes) back into text.
@@ -731,9 +766,6 @@ func (t *tasmotaAPI) cmdPeers(name string) any {
 	defer t.mu.Unlock()
 	list := []peerJSON{}
 	for _, m := range t.mdns {
-		if time.Since(m.seen) > 15*time.Minute {
-			continue
-		}
 		mode := "steuve"
 		if isHemsType(m.Type) {
 			mode = "hems"
